@@ -1,0 +1,26 @@
+# This file describes a Fastly Compute package.
+
+language = "javascript"
+manifest_version = 2
+name = "fos-object-ui"
+service_id = ""
+
+[scripts]
+  build = "npm run build"
+
+[local_server]
+ 
+  # Explicitly allow the US-East endpoint
+  [local_server.backends.us_east]
+    url = "https://us-east.object.fastlystorage.app"
+    override_host = "us-east.object.fastlystorage.app"
+
+  # Explicitly allow the US-West endpoint
+  [local_server.backends.us_west]
+    url = "https://us-west.object.fastlystorage.app"
+    override_host = "us-west.object.fastlystorage.app"
+
+  # Explicitly allow the EU-Central endpoint
+  [local_server.backends.eu_central]
+    url = "https://eu-central.object.fastlystorage.app"
+    override_host = "eu-central.object.fastlystorage.app"
