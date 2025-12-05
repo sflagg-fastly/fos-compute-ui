@@ -23,7 +23,7 @@ if (window.location.hostname === '127.0.0.1') {
 const $settingsForm = document.getElementById('settingsForm');
 
 if ($settingsForm) {
-    document.getElementById('settingsForm').addEventListener('submit', function(event) {
+    document.getElementById('settingsForm').addEventListener('submit', async function(event) {
         event.preventDefault();
         const region = document.getElementById('region').value;
         const accessKeyId = document.getElementById('accessKeyId').value;
@@ -33,6 +33,17 @@ if ($settingsForm) {
         localStorage.setItem('region', region);
         localStorage.setItem('accessKeyId', accessKeyId);
         localStorage.setItem('secretKey', secretKey);
+
+        // Also create/update a session cookie on the backend
+        try {
+            await fetch('/session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ region, accessKeyId, secretKey })
+            });
+        } catch (e) {
+            console.error('Error saving session on server:', e);
+        }
         
         alert('Parameters saved!');
     });
@@ -73,7 +84,7 @@ async function fetchBuckets() {
     }
 
     try {
-        // Credentials in URL
+        // Credentials in URL (XHR only, not address bar)
         const response = await fetch(\`/s3/list-buckets?\${authQuery}\`);
         const result = await response.json();
 
@@ -217,7 +228,7 @@ if ($uploadForm) {
 
         try {
             showMessage('Uploading...', 'bg-blue-200 text-blue-800');
-            // Credentials in URL for Upload too
+            // Credentials in URL for Upload too (XHR only)
             const response = await fetch(\`/s3/bucket/\${bucketName}?\${uploadQuery}\`, {
                 method: 'POST',
                 body: file 
@@ -258,7 +269,7 @@ async function fetchBucketFiles() {
     if (!authQuery) return;
 
     try {
-        // Credentials in URL
+        // Credentials in URL (XHR only)
         const response = await fetch(\`/s3/bucket/\${bucketName}?\${authQuery}\`);
         const result = await response.json();
 
@@ -270,8 +281,9 @@ async function fetchBucketFiles() {
 
         if (result.files && result.files.length > 0) {
             result.files.forEach(file => {
-                // Construct view link with credentials embedded (so it works on click)
-                const viewLink = \`/s3/bucket/\${bucketName}/\${file.Key}?\${authQuery}\`;
+                // Clean view link: no credentials in the URL bar
+                const encodedKey = encodeURIComponent(file.Key);
+                const viewLink = \`/s3/bucket/\${bucketName}/\${encodedKey}\`;
                 
                 const row = document.createElement('tr');
                 row.innerHTML = \`
@@ -419,7 +431,6 @@ function renderBucketPage(bucketName) {
     </div>
 </div>
   `;
-  // *** changed here: no template literal for title ***
   return renderLayout("Bucket: " + bucketName, html);
 }
 
@@ -585,7 +596,42 @@ async function fosGetObject(region, accessKeyId, secretKey, bucketName, key) {
 }
 
 // -----------------------------------------------------------------------------
-// 4. ROUTER / SERVER LOGIC
+// 4. SESSION COOKIE HELPERS
+// -----------------------------------------------------------------------------
+
+function getSessionFromRequest(req) {
+  // Find the Cookie header in a case-insensitive way
+  let cookieHeader = "";
+  for (const [name, value] of req.headers) {
+    if (name.toLowerCase() === "cookie") {
+      cookieHeader = value;
+      break;
+    }
+  }
+
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const match = cookieHeader.match(/(?:^|;\s*)fos_session=([^;]+)/);
+  if (!match) return null;
+
+  try {
+    const encoded = match[1];
+    const json = atob(decodeURIComponent(encoded));
+    const data = JSON.parse(json);
+
+    if (!data.region || !data.accessKeyId || !data.secretKey) return null;
+    return data;
+  } catch (e) {
+    // Optional: add logging if you want to see failures
+    console.log("Error parsing fos_session cookie:", e);
+    return null;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 5. ROUTER / SERVER LOGIC
 // -----------------------------------------------------------------------------
 
 const router = new Router();
@@ -605,6 +651,38 @@ router.get("/app.js", (req, res) => {
 router.get("/bucket/:bucketName", (req, res) => {
   res.headers.set("Content-Type", "text/html");
   res.send(renderBucketPage(req.params.bucketName));
+});
+
+// -- Session endpoint --
+
+router.post("/session", async (req, res) => {
+  let body = {};
+  try {
+    body = await req.json();
+  } catch (e) {
+    // ignore
+  }
+
+  const region = body.region;
+  const accessKeyId = body.accessKeyId;
+  const secretKey = body.secretKey;
+
+  if (!region || !accessKeyId || !secretKey) {
+    res.status = 400;
+    return res.json({ error: "Missing credentials" });
+  }
+
+  const payload = btoa(
+    JSON.stringify({ region, accessKeyId, secretKey })
+  );
+
+  // HttpOnly cookie so JS can't read it; no Secure flag so it works on localhost
+  res.headers.set(
+    "Set-Cookie",
+    `fos_session=${encodeURIComponent(payload)}; Path=/; HttpOnly; SameSite=Lax`
+  );
+
+  res.json({ ok: true });
 });
 
 // -- API: Buckets --
@@ -751,23 +829,23 @@ router.post("/s3/bucket/:bucketName", async (req, res) => {
 });
 
 router.get("/s3/bucket/:bucketName/:key", async (req, res) => {
-  const url = new URL(req.url);
-  const region = url.searchParams.get("region") || "";
-  const accessKeyId = url.searchParams.get("accessKeyId") || "";
-  const secretKey = url.searchParams.get("secretKey") || "";
+  const session = getSessionFromRequest(req);
 
-  if (!region || !accessKeyId || !secretKey) {
-    res.status = 400;
-    return res.send("Missing credentials.");
+  if (!session) {
+    res.status = 401;
+    return res.send("Missing credentials; please save your FOS settings again.");
   }
 
+  const { region, accessKeyId, secretKey } = session;
+
   try {
+    const key = decodeURIComponent(req.params.key || "");
     const awsRes = await fosGetObject(
       region,
       accessKeyId,
       secretKey,
       req.params.bucketName,
-      req.params.key
+      key
     );
 
     const ct = awsRes.headers.get("content-type");
@@ -785,7 +863,7 @@ router.get("/s3/bucket/:bucketName/:key", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// 5. START
+// 6. START
 // -----------------------------------------------------------------------------
 
 router.listen();
